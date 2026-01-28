@@ -17,7 +17,7 @@ public class MyRobot extends BehaviorBasedAgent {
 
         Sensors sensors = this.getSensors();
 
-        Behavior[] behaviors = {
+        Behavior[] behaviors =  {
                 new ReachGoal(sensors, this),      // 0
                 new DockInBox(sensors, this),      // 1
                 new CorridorCenter(sensors, this), // 2
@@ -57,20 +57,29 @@ class FollowLight extends Behavior {
         double luxL = lightL.getLux();
         double luxR = lightR.getLux();
         double diff = luxL - luxR;
+        double avg = 0.5 * (luxL + luxR);
 
         double v = (Math.abs(diff) < 0.03) ? 0.55 : 0.40;
-
         double rot = -0.9 * diff;
+
         if (rot > 0.35) rot = 0.35;
         if (rot < -0.35) rot = -0.35;
         if (Math.abs(diff) <= 0.01) rot = 0;
 
+        // 💡 Boost forward when strong light seen
+        if (avg >= 0.66 && Math.abs(diff) < 0.02) {
+            System.out.println("[FollowLight] Strong goal → driving straight in");
+            return new Velocities(0.65, 0);
+        }
+
         return new Velocities(v, rot);
     }
 
-    public boolean isActive() { return true; }
-}
 
+    public boolean isActive() {
+        return true;
+    }
+}
 
 /** ✅ STOP μόνο όταν το Dock δηλώσει “docked” */
 class ReachGoal extends Behavior {
@@ -100,121 +109,166 @@ class ReachGoal extends Behavior {
  */
 class DockInBox extends Behavior {
 
-    // Από το δικό σου screenshot: maxLux ~0.63 όταν είναι “στην πόρτα”
-    private static final double ENTER_LUX = 0.55;     // ξεκινάμε docking νωρίτερα
-    private static final double INSIDE_LUX = 0.62;    // θεωρούμε ότι είμαστε “μέσα/στόχος”
-    private static final double EXIT_LUX = 0.50;      // για να μη μπαίνει/βγαίνει συνέχεια
+    // Light thresholds
+    private static final double ENTER_LUX = 0.68;
+    private static final double INSIDE_LUX = 0.63;
 
-    // Sonar gates για πόρτα/διάδρομο
-    private static final double WALL_NEAR = 0.95;     // βλέπω τοίχο κοντά δεξιά/αριστερά => είμαι στο στενό
-    private static final double FRONT_SAFE = 0.40;    // αν μπροστά είναι πιο κοντά, κόψε
+    // Sonar thresholds
+    private static final double WALL_NEAR = 0.4;
 
-    // Align tuning
+    // Alignment tuning
     private static final double ALIGN_V = 0.18;
-    private static final double ALIGN_ROT_MAX = 0.22;
+    private static final double ALIGN_ROT_MAX = 0.25;
 
     // Push tuning
     private static final int PUSH_TICKS = 80;
     private static final double PUSH_V = 0.26;
 
-    // Inside detection by geometry (αν το lux δεν “γράφει” σωστά)
-    private static final double INSIDE_SIDE_NEAR = 0.85;
+    // Geometry inside check
+    private static final double INSIDE_SIDE_NEAR = 0.65;
 
     private enum Mode { IDLE, ALIGN, PUSH, STOPPED }
 
     private Mode mode = Mode.IDLE;
+
     private int pushLeft = 0;
     private boolean docked = false;
+    private int stableTicks = 0;
+
 
     private final LightSensor lightL;
     private final LightSensor lightR;
 
     private static DockInBox INSTANCE;
 
-    public static DockInBox getInstance() { return INSTANCE; }
+    public static DockInBox getInstance() {
+        return INSTANCE;
+    }
 
     public DockInBox(Sensors sensors, MyRobot robot) {
         super(sensors);
+
         this.lightL = robot.getLightLeftSensor();
         this.lightR = robot.getLightRightSensor();
+
+
         INSTANCE = this;
     }
 
-    public boolean isDocked() { return docked; }
+    public boolean isDocked() {
+        return docked;
+    }
+
+    // =====================================================
+    // MAIN BEHAVIOR
+    // =====================================================
 
     public Velocities act() {
-        if (mode == Mode.STOPPED) {
-            docked = true;
-            return new Velocities(0, 0);
-        }
 
         RangeSensorBelt s = getSensors().getSonars();
+
         double luxL = lightL.getLux();
         double luxR = lightR.getLux();
         double maxLux = Math.max(luxL, luxR);
 
-        double left = min(s, 2, 4);
+        double left  = min(s, 2, 4);
         double right = min(s, 8, 10);
         double front = Math.min(Math.min(s.getMeasurement(0), s.getMeasurement(1)), s.getMeasurement(11));
 
-        // ✅ αν είμαστε “μέσα”, σταμάτα
-        if (isInside(maxLux, left, right)) {
-            mode = Mode.STOPPED;
-            docked = true;
-            return new Velocities(0, 0);
+        boolean inCorridor = (left < WALL_NEAR) || (right < WALL_NEAR);
+
+
+        // 🔍 Log the sensors to verify state
+        System.out.println("[Dock] IDLE mode check: maxLux=" + maxLux + " inCorridor=" + inCorridor + " front=" + front + " mode=" + mode);
+
+        // Try to enter ALIGN mode when in corridor and near the light
+        if (mode == Mode.IDLE && maxLux >= ENTER_LUX && (inCorridor || front > 0.5)) {
+            mode = Mode.ALIGN;
+            System.out.println("[Dock] Entering ALIGN mode. Lux=" + maxLux);
         }
 
-        // προστασία: αν είναι πολύ κοντά μπροστά, σταμάτα/μην σπρώχνεις
-        if (front < FRONT_SAFE) {
-            // μικρή στροφή για να ξεκολλήσει
-            return new Velocities(0.0, 0.20);
-        }
-
+        // ================================
+        // ALIGN MODE
+        // ================================
         if (mode == Mode.ALIGN) {
-            // στόχος: κεντράρισμα στην πόρτα
-            // 1) Χρησιμοποιούμε side sonar error (right-left)
-            double err = (right - left); // αν right > left, είμαστε πιο κοντά αριστερά -> στρίψε λίγο δεξιά κλπ
-            double rotSonar = 0.9 * err;
+            double error = right - left;
+            double rot = 1.8 * error;  // slightly stronger correction
 
-            // 2) Χρησιμοποιούμε light diff για “τελικό” κλείδωμα
-            double diff = (luxL - luxR);
-            double rotLight = -0.4 * diff;
-
-            double rot = rotSonar + rotLight;
             if (rot > ALIGN_ROT_MAX) rot = ALIGN_ROT_MAX;
             if (rot < -ALIGN_ROT_MAX) rot = -ALIGN_ROT_MAX;
 
-            // όταν έχουμε σχετικά “ίσια” (μικρό error), πάμε σε PUSH
-            if (Math.abs(err) < 0.10 && Math.abs(diff) < 0.20) {
+            boolean wellAligned = Math.abs(error) < 0.025;   // tighter threshold
+            boolean nearWall = front < 0.45;
+
+
+            // Count stable alignment ticks
+            if (wellAligned) {
+                stableTicks++;
+            } else {
+                stableTicks = 0;
+            }
+
+            System.out.println("[Dock] ALIGN left=" + left +
+                    " right=" + right +
+                    " error=" + error +
+                    " stableTicks=" + stableTicks);
+
+            // Only push after multiple stable frames
+            if (stableTicks >= 4 && nearWall) {
                 mode = Mode.PUSH;
-                pushLeft = PUSH_TICKS;
-                return new Velocities(PUSH_V, 0.0);
+                pushLeft = PUSH_TICKS + 10;
+                System.out.println("[Dock] ALIGN stable → PUSH");
+                return new Velocities(PUSH_V, 0);
             }
 
             return new Velocities(ALIGN_V, rot);
         }
 
+
+        // ================================
+        // PUSH MODE
+        // ================================
         if (mode == Mode.PUSH) {
-            pushLeft--;
+            double error = right - left;
+            double rot = 0.4 * error; // slight correction while pushing
+            if (rot > 0.2) rot = 0.2;
+            if (rot < -0.2) rot = -0.2;
 
-            // Αν στη διάρκεια του push χάσουμε το φως πολύ (δηλ. βγήκαμε), γύρνα σε ALIGN
-            if (maxLux < EXIT_LUX) {
-                mode = Mode.ALIGN;
-                return new Velocities(0.0, 0.25);
+            if (front < 0.1) {
+                System.out.println("[Dock] 🚨 EMERGENCY STOP: front=" + front);
+                mode = Mode.STOPPED;
+                docked = true;
+                return new Velocities(0, 0);
             }
 
-            if (pushLeft <= 0) {
-                // τελείωσε το push, αν δεν είμαστε μέσα ακόμη -> ξανά ALIGN (μην φύγει να κάνει γύρες!)
-                mode = Mode.ALIGN;
-                return new Velocities(0.0, 0.20);
+            if (pushLeft-- > 0) {
+                return new Velocities(PUSH_V, rot);  // <- not just straight!
+            } else {
+                mode = Mode.STOPPED;
+                docked = true;
+                return new Velocities(0, 0);
             }
-
-            return new Velocities(PUSH_V, 0.0);
         }
 
-        // default safety
-        return new Velocities(0.0, 0.0);
+
+        // ================================
+        // STOP IF FULLY INSIDE
+        // ================================
+        if (isInside(maxLux, left, right)) {
+            mode = Mode.STOPPED;
+            docked = true;
+            System.out.println("[Dock] INSIDE → STOP");
+            return new Velocities(0, 0);
+        }
+
+        // Otherwise: do nothing
+        return new Velocities(0, 0);
     }
+
+
+    // =====================================================
+    // ACTIVATION LOGIC
+    // =====================================================
 
     public boolean isActive() {
         if (mode == Mode.STOPPED) return false;
@@ -224,37 +278,41 @@ class DockInBox extends Behavior {
         double luxR = lightR.getLux();
         double maxLux = Math.max(luxL, luxR);
 
-        double left = min(s, 2, 4);
+        double left  = min(s, 2, 4);
         double right = min(s, 8, 10);
 
         boolean inCorridor = (left < WALL_NEAR) && (right < WALL_NEAR);
 
-        // Ενεργοποίηση docking: κοντά στο φως ΚΑΙ σε “στενό/είσοδο”
-        if (mode == Mode.IDLE) {
-            if (maxLux >= ENTER_LUX && inCorridor) {
-                mode = Mode.ALIGN;
-                return true;
-            }
-            return false;
+        // Start docking
+        if (mode == Mode.IDLE && maxLux >= ENTER_LUX && inCorridor) {
+            mode = Mode.ALIGN;
+            System.out.println("[Dock] IDLE → ALIGN (start docking)");
         }
 
-        // Αν είμαστε ήδη σε docking mode, παραμένει active
         return (mode == Mode.ALIGN || mode == Mode.PUSH);
     }
 
+
+    // =====================================================
+    // HELPERS
+    // =====================================================
+
     private boolean isInside(double maxLux, double left, double right) {
-        // 1) με lux
+
         if (maxLux >= INSIDE_LUX) return true;
 
-        // 2) με geometry: και οι δύο πλευρές “κοντά” => είμαστε μέσα στο πλαίσιο/κουτί
         return (left < INSIDE_SIDE_NEAR) && (right < INSIDE_SIDE_NEAR);
     }
 
     private double min(RangeSensorBelt s, int a, int b) {
+
         double m = s.getMeasurement(a);
+
         for (int i = a + 1; i <= b; i++) {
-            if (s.getMeasurement(i) < m) m = s.getMeasurement(i);
+            if (s.getMeasurement(i) < m)
+                m = s.getMeasurement(i);
         }
+
         return m;
     }
 }
@@ -301,14 +359,20 @@ class CorridorCenter extends Behavior {
     }
 
     public boolean isActive() {
-        double maxLux = Math.max(lightL.getLux(), lightR.getLux());
-        if (maxLux >= CORRIDOR_GATE_LUX) return false;
+        double luxL = lightL.getLux();
+        double luxR = lightR.getLux();
+        double maxLux = Math.max(luxL, luxR);
 
         RangeSensorBelt s = getSensors().getSonars();
+        double front = Math.min(min(s, 0, 1), s.getMeasurement(11));
         double left = min(s, 2, 4);
         double right = min(s, 8, 10);
 
-        return (left < WALL_NEAR) && (right < WALL_NEAR);
+        boolean inCorridor = (left < WALL_NEAR) && (right < WALL_NEAR);
+        boolean frontBlocked = front < FRONT_CLEAR;
+
+        // ✅ Enhancement: Stay active even near goal if obstacle still in front
+        return inCorridor && (maxLux < CORRIDOR_GATE_LUX || frontBlocked);
     }
 
     private double min(RangeSensorBelt s, int a, int b) {
@@ -329,6 +393,9 @@ class CircumNavigate extends Behavior {
 
     private boolean active = false;
     private boolean clockwise = true;
+    private boolean committedToGoal = false;
+
+
 
     private double entryLuxAvg = 0;
 
@@ -382,14 +449,20 @@ class CircumNavigate extends Behavior {
         double luxR = lightR.getLux();
         double luxAvg = 0.5 * (luxL + luxR);
 
-        if (Math.max(luxL, luxR) >= GOAL_GATE_LUX) {
-            active = false;
+        // 🔒 Lock in goal if bright light once seen
+        if (!committedToGoal && luxAvg >= 0.66) {
+            committedToGoal = true;
+            System.out.println("[iBug] COMMITTING TO GOAL → disabling avoidance");
             return false;
         }
 
+        // Already committed? Don't block anymore
+        if (committedToGoal) return false;
+
         if (!active) {
-            if (sonars.getFrontQuadrantHits() > 0
-                    && sonars.getMeasurement(minFrontIndex(sonars)) < SAFETY) {
+            if (sonars.getFrontQuadrantHits() > 0 &&
+                    sonars.getMeasurement(minFrontIndex(sonars)) < SAFETY) {
+
                 active = true;
                 entryLuxAvg = luxAvg;
                 clockwise = (luxL < luxR);
@@ -398,13 +471,20 @@ class CircumNavigate extends Behavior {
             return false;
         }
 
-        if (sonars.getFrontQuadrantHits() == 0 && luxAvg > entryLuxAvg + 0.03) {
+        // If already active, only stay if no improvement
+        boolean frontClear = sonars.getFrontQuadrantHits() == 0;
+        boolean lightImproved = luxAvg > entryLuxAvg + 0.02;
+        boolean wellAligned = Math.abs(luxL - luxR) < 0.02;
+
+        // Exit condition
+        if (frontClear && lightImproved && wellAligned) {
             active = false;
             return false;
         }
 
         return true;
     }
+
 
     private int minFrontIndex(RangeSensorBelt sonars) {
         int min = 0;
